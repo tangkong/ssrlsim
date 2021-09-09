@@ -29,7 +29,8 @@ RE.preprocessors.append(sd)
 # Set up a Broker.
 from databroker import Broker
 
-db = Broker.named("mongo-intake")
+db = Broker.named("temp") #mongo-intake")
+print(f'Using databroker: {db.name}')
 
 # and subscribe it to the RunEngine
 RE.subscribe(db.insert)

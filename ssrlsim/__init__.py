@@ -73,15 +73,15 @@ class SynHDF5Filestore(SynSignal):
         resource, datum_factory = resource_factory(
                 spec='XSP3',
                 root=tmpRoot,
-                resource_path=tmpRoot / tmpPath,
-                resource_kwargs={'filename' : fn},
+                resource_path=tmpRoot / tmpPath / fn,
+                resource_kwargs={}, # Handler takes only one 'filename' argument, which is pulled from the... 
                 path_semantics='windows')
-        datum = datum_factory({'point_number': self.point_number})
-             
+        datum = datum_factory({})
+        print(resource)     
         self._asset_docs_cache.append(('resource', resource))
         self._asset_docs_cache.append(('datum', datum))
 
-        fpath = Path(resource['root']) / resource['resource_path'] / fn
+        fpath = Path(resource['root']) / resource['resource_path']
         # for h5 spec
         with h5py.File(fpath, 'w') as f:
             e = f.create_group('/entry/instrument/detector')
