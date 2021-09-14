@@ -3,19 +3,39 @@ OPHYD classes for simulated beamline SSRL1-5, in hitp mode of operation
 Should mimic ophyd devices as closely as possible for operation
 
 Many ideas stolen from various bluesky tutorials
+
+Device List:
+Stage (px, py, pz, th, vx, vy)
+Laser Range Finder (linked to stage v?)
+xspress3
+an area detector (MarCCD)
+I0, I1, shutter?
+
+Plans:
+basic bluesky plans
+grid scan
+
+Framework:
+subscribe stage to baseline
+
+To-Do: 
+- make I1, I0, reactive to shutter
+
 '''
 import os
 import numpy as np
 from pathlib import Path
 
-from ophyd import Signal, Device, Component as Cpt
-from ophyd.sim import SynAxis
+from ophyd import Signal, Device, Component as Cpt, MotorBundle
+from ophyd.sim import SynAxis 
 
 import bluesky.plan_stubs as bps
-from ssrltools.devices.hitp import HiTpStage
 
 from . import ArraySynSignal, gen_wafer_locs, SynTiffFilestore, SynHDF5Filestore
 from .images import make_random_peaks, generate_image
+
+# initialize RunEngine, temp databroker
+from ssrlsim.scripts.start_RE import *
 
 # general beamline components (motors, shutter, beam)
 
@@ -99,29 +119,29 @@ class SynLaserRangeFinder(Signal):
 
         return self._readback # in "V"
 
-class SynHiTpStage(HiTpStage):
+class SynHiTpStage(MotorBundle):
     """
-    Combined class for HiTp stage.  
-    * Gathers stage and plate motors
-    * Stores sample locations
-
-    Simplifies task of aligning and remembering sample positions
+    HiTp Sample Stage
     """
     #stage x, y
-    stage_x = Cpt(SynAxis, name='stage_x', kind='hinted')
-    stage_y = Cpt(SynAxis, name='stage_y', kind='hinted')
-    stage_z = Cpt(SynAxis, name='stage_z', kind='hinted')
+    px = Cpt(SynAxis, name='stage_x', kind='hinted')
+    py = Cpt(SynAxis, name='stage_y', kind='hinted')
+    pz = Cpt(SynAxis, name='stage_z', kind='hinted')
 
     # plate vert adjust motor 1, 2
-    plate_x = Cpt(SynAxis, name='plate_x')
-    plate_y = Cpt(SynAxis, name='plate_y')
+    vx = Cpt(SynAxis, name='plate_x')
+    vy = Cpt(SynAxis, name='plate_y')
 
-    theta = Cpt(SynAxis, name='theta')
+    th = Cpt(SynAxis, name='theta')
 
-stage = SynHiTpStage(name='HiTp_Stage')
+s_stage = SynHiTpStage('', name='s_stage')
 
-lrf = SynLaserRangeFinder(stage.stage_x, stage.stage_y, stage.plate_x, 
-                            stage.plate_y, name='lrf')
+lrf = SynLaserRangeFinder(s_stage.px, s_stage.py, s_stage.vx, 
+                            s_stage.vy, name='lrf')
+
+shutter = SynAxis(name='FastShutter')
+I1 = SynAxis(name='I1', value=1)
+I0 = SynAxis(name='I0', value=1)
 
 
 class SynBeamStopDetector(Signal):
@@ -140,7 +160,7 @@ class SynBeamStopDetector(Signal):
         self._readback = val
         return self._readback
 
-ptDet = SynBeamStopDetector(stage.stage_z, name='ptDet')
+ptDet = SynBeamStopDetector(s_stage.pz, name='ptDet')
 
 # Create simulated image for dexela detector
 def dex_func():
@@ -155,11 +175,11 @@ def xsp3_func():
     '''
     Return a simulated MCA array
     '''
-    x = np.linspace(1, 6, num=301)
+    x = np.linspace(1, 2000, num=2000)
     intensity = make_random_peaks(x)
     return intensity
 
-class SynDex(ArraySynSignal, SynTiffFilestore):
+class SynMar(ArraySynSignal, SynTiffFilestore):
     pass
 
 class SynXsp3(ArraySynSignal, SynHDF5Filestore):
@@ -168,6 +188,79 @@ class SynXsp3(ArraySynSignal, SynHDF5Filestore):
 
 fpath = Path(os.getcwd()) / 'fstore'
 print(f'Filestore path: {fpath}')
-dexDet = SynDex(name='Dexela 2923', fstore_path=fpath, func=dex_func)
+dexDet = SynMar(name='MarCCD', fstore_path=fpath, func=dex_func)
 
 xsp3 = SynXsp3(name='Xspress3EXAMPLE', fstore_path=fpath, func=xsp3_func)
+
+from ophyd.sim import SynGauss, motor
+import time
+
+class DelaySynGauss(SynGauss):
+    def trigger(self, *args, **kwargs):
+        print('exposure time')
+        # time.sleep(20)
+        # yield from bps.sleep(5)
+        return self.val.trigger(*args, **kwargs)
+from ophyd.sim import det
+# det = DelaySynGauss('det', motor, 'motor', center=0, Imax=5, sigma=0.5, labels={'detectors'})
+
+def test_rock(det, motor, min, max, *, md=None):
+    uid = yield from bps.open_run(md)
+
+    # read exposure time from detector, depends on detector implementation
+    try:
+        exposure_time = det.exposure_time
+    except:
+        exposure_time = 30
+
+    yield from bps.trigger(det, wait=False)
+    start = time.time()
+    now = time.time()
+    while (now-start) < exposure_time:
+        # this logic is reasonable, but for normal area detectors the trigger won't be waitable
+        # will have to read exposure time, then wiggle for that amount of time?
+        print('1 cycle')
+        yield from bps.sleep(1)
+        yield from bps.mov(motor, min)
+        yield from bps.mov(motor, max)
+        now = time.time()
+    yield from bps.create('primary')
+    reading = (yield from bps.read(det))
+    yield from bps.save()
+    yield from bps.close_run()
+    return uid
+
+
+# Looking again at ramp_plan, might be a better option?  Looks a lot like past attempts
+# looks like this is more suited toward taking periodic measurements as something moves,
+# Rather than taking one measurement as something moves 
+from bluesky.plans import ramp_plan
+def wiggle_plan(det, motor, start, stop):
+    timeout = 60
+    def go_plan():
+        # Plan to start ramp.  yields a generator and ophyd.StatusBase object
+        # Need to correctly finish status object
+        # Involves starting the trigger/acquisition
+        yield from bps.count()
+
+    def inner_plan():
+        # plan to run in the midst of the ramp.  Should save events....?
+        # in our case there's no events during this inner plan, since we want 
+        # only one exposure
+        yield from bps.trigger_and_read(det, name='primary')
+
+
+    yield from ramp_plan(go_plan, inner_plan, timeout=timeout, take_pre_data=False,
+                                period=1)
+
+# finalize imports, namespace
+px = s_stage.px
+py = s_stage.py
+pz = s_stage.pz
+
+vx = s_stage.vx
+vy = s_stage.vy
+
+th = s_stage.th
+
+sd.baseline.append(s_stage)
